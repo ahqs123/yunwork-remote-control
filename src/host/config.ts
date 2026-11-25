@@ -124,9 +124,9 @@ export function resolveConfig(config: Config): ResolvedConfig {
     connectorSourceDir,
     apiBaseUrl: normalizeServerOrigin(config.apiBaseUrl ?? contract?.serverUrl ?? CLOUD_API_BASE_URL),
     uvPath: config.uvPath ?? process.env['UV_PATH'] ?? 'uv',
-    runtimeType: contract?.runtimeType ?? 'dsh',
-    ...(contract?.webUrl !== undefined ? { anywhereWebUrl: contract.webUrl } : {}),
-    ...(contract?.productName !== undefined ? { productName: contract.productName } : {}),
-    ...(contract?.shortName !== undefined ? { shortName: contract.shortName } : {}),
+    runtimeType: contract?.runtimeType ?? 'yunwork',
+    anywhereWebUrl: contract?.webUrl ?? CLOUD_API_BASE_URL,
+    productName: contract?.productName ?? '云大师 Agent',
+    shortName: contract?.shortName ?? '云大师',
   }
 }

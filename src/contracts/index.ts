@@ -6,7 +6,7 @@ import type { ConnectorLogPage, ConnectorLogQuery, BridgeLogSnapshot, RuntimeLog
 // The Connector bridge protocol stays in contracts/dsh-bridge.
 export const HOST_NAMESPACE = 'agentsAnywhereOnboarding'
 export const OAUTH_CLIENT_ID = 'agents-anywhere-dsh-plugin'
-export const CLOUD_API_BASE_URL = 'https://web.agents-anywhere.com'
+export const CLOUD_API_BASE_URL = 'https://agent.yundashi.com'
 
 export type DesktopDetection =
   | { status: 'absent'; message: string }
