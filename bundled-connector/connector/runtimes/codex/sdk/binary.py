@@ -1,0 +1,300 @@
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+from connector.launch import launch_target
+from connector.logging import logger
+
+CodexRuntimeBinaryMode = Literal["prefer_system", "sdk_bundled"]
+CodexRuntimeBinarySource = Literal["configured", "system", "sdk_bundled"]
+
+LOGIN_SHELL_PATH_MARKER = "__AGENTS_ANYWHERE_PATH__"
+
+
+@dataclass(frozen=True, slots=True)
+class LoginShellPathResult:
+    shell: str | None
+    path: str | None
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CodexRuntimeBinarySelection:
+    mode: CodexRuntimeBinaryMode
+    source: CodexRuntimeBinarySource
+    codex_bin: str | None
+    login_shell: str | None
+    login_shell_path: str | None
+    reason: str | None = None
+
+
+def default_login_shell() -> str | None:
+    shell = os.environ.get("SHELL")
+    if isinstance(shell, str) and shell:
+        return shell
+
+    if os.name == "posix":
+        import pwd
+
+        try:
+            return pwd.getpwuid(os.getuid()).pw_shell
+        except KeyError:
+            return None
+
+    return None
+
+
+def read_login_shell_path(shell: str | None = None) -> LoginShellPathResult:
+    """Read PATH after the user's login shell has loaded its shell rc files.
+
+    Side effects:
+    - starts the user's shell with login and interactive flags
+    - waits up to a short timeout for shell initialization
+    """
+
+    if sys.platform == "win32":
+        return LoginShellPathResult(shell=None, path=None)
+
+    selected_shell = shell or default_login_shell()
+    if selected_shell is None:
+        return LoginShellPathResult(
+            shell=None,
+            path=None,
+            error="login shell is unavailable",
+        )
+
+    command = f'printf "{LOGIN_SHELL_PATH_MARKER}%s\\n" "$PATH"'
+    try:
+        completed = subprocess.run(
+            [selected_shell, "-lic", command],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return LoginShellPathResult(
+            shell=selected_shell,
+            path=None,
+            error=str(exc) or exc.__class__.__name__,
+        )
+
+    for line in reversed(completed.stdout.splitlines()):
+        if line.startswith(LOGIN_SHELL_PATH_MARKER):
+            path_value = line.removeprefix(LOGIN_SHELL_PATH_MARKER)
+            if path_value:
+                return LoginShellPathResult(shell=selected_shell, path=path_value)
+
+    stderr = completed.stderr.strip()
+    reason = stderr or f"shell exited with code {completed.returncode}"
+    return LoginShellPathResult(shell=selected_shell, path=None, error=reason)
+
+
+def codex_runtime_environment(
+    environment_overrides: Mapping[str, object] | None,
+    *,
+    codex_home: str | None = None,
+) -> tuple[dict[str, str], LoginShellPathResult]:
+    env = dict(os.environ)
+    shell_path = read_login_shell_path()
+    if shell_path.path is not None:
+        env["PATH"] = shell_path.path
+    elif shell_path.error is not None:
+        logger.debug(
+            "codex login shell PATH read failed shell={} error={}",
+            shell_path.shell,
+            shell_path.error,
+        )
+
+    if environment_overrides is None:
+        if codex_home is not None:
+            env["CODEX_HOME"] = codex_home
+        return env, shell_path
+
+    for key, value in environment_overrides.items():
+        if value is None:
+            env.pop(key, None)
+            continue
+        if isinstance(value, str):
+            env[key] = value
+
+    if codex_home is not None:
+        env["CODEX_HOME"] = codex_home
+
+    return env, shell_path
+
+
+def select_codex_runtime_binary(
+    mode: CodexRuntimeBinaryMode,
+    environment: Mapping[str, str],
+    shell_path: LoginShellPathResult,
+    *,
+    configured_path: str | None = None,
+    model_gateway: bool = False,
+) -> CodexRuntimeBinarySelection:
+    candidate = configured_path
+    if candidate is not None:
+        candidate = (
+            find_executable_on_path(candidate, environment.get("PATH")) or candidate
+        )
+    source: CodexRuntimeBinarySource = "configured"
+    reason = "system Codex disabled by useSystemCodex"
+    if candidate is None and mode == "prefer_system":
+        candidate = find_executable_on_path("codex", environment.get("PATH"))
+        source = "system"
+        reason = "system codex binary was not found on PATH"
+
+    if candidate is not None:
+        error = codex_version_error(
+            candidate, environment, model_gateway=model_gateway
+        )
+        if error is None:
+            return CodexRuntimeBinarySelection(
+                mode=mode,
+                source=source,
+                codex_bin=candidate,
+                login_shell=shell_path.shell,
+                login_shell_path=shell_path.path,
+                reason="configured by codexExecutablePath"
+                if source == "configured"
+                else None,
+            )
+        reason = f"{source} Codex version check failed: {error}"
+        logger.warning("{}; falling back to SDK Codex path={}", reason, candidate)
+
+    return CodexRuntimeBinarySelection(
+        mode=mode,
+        source="sdk_bundled",
+        codex_bin=None,
+        login_shell=shell_path.shell,
+        login_shell_path=shell_path.path,
+        reason=reason,
+    )
+
+
+def codex_version_error(
+    candidate: str,
+    environment: Mapping[str, str],
+    *,
+    model_gateway: bool = False,
+) -> str | None:
+    """Validate the executable with the same environment used by the SDK."""
+    try:
+        # On Windows, PIPE capture starts reader threads before checking the
+        # timeout. A stuck Thread.start() can therefore outlive timeout=5.0.
+        with tempfile.TemporaryFile() as output:
+            result = subprocess.run(
+                codex_launch_command(candidate, ["--version"], environment),
+                env=dict(environment),
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=5.0,
+            )
+            output.seek(0)
+            stdout = output.read().decode("utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return str(exc) or exc.__class__.__name__
+    if result.returncode != 0:
+        return f"exited with code {result.returncode}"
+    match = re.search(
+        r"(?m)^codex(?:-cli)? (\d+\.\d+\.\d+(?:[-+][\w.-]+)?)\s*$", stdout
+    )
+    if match is None:
+        return "missing or invalid Codex version output"
+    if model_gateway and codex_rejects_other_thread_providers(match.group(1)):
+        return (
+            f"Codex {match.group(1)} cannot continue model gateway threads while "
+            "another provider is the default; upgrade Codex past 0.167"
+        )
+    return None
+
+
+def codex_rejects_other_thread_providers(version: str) -> bool:
+    """Codex 0.166 and 0.167 refuse threads whose provider is not the default.
+
+    Their app-server checks a thread's saved provider against the provider
+    selected by config.toml and launch flags, ignoring per-request overrides
+    (openai/codex#57840). One app-server can then serve either gateway threads
+    or the user's own threads, never both. openai/codex#59503 removed the
+    check in 0.168.0-alpha.7.
+    """
+
+    match = re.fullmatch(r"0\.(\d+)\.\d+(?:-alpha\.(\d+))?(?:[-+.][\w.-]*)?", version)
+    if match is None:
+        return False
+    minor = int(match.group(1))
+    if minor in (166, 167):
+        return True
+    alpha = match.group(2)
+    return minor == 168 and alpha is not None and int(alpha) < 7
+
+
+def find_executable_on_path(name: str, path_value: str | None) -> str | None:
+    if path_value is None:
+        return None
+    if sys.platform == "win32":
+        # PowerShell scripts are normally absent from PATHEXT. Do not select
+        # npm's extensionless POSIX shim, even when Python's which returns it.
+        suffixes = (
+            ("",) if Path(name).suffix else (".exe", ".com", ".cmd", ".bat", ".ps1")
+        )
+        for directory in path_value.split(";"):
+            if not directory:
+                continue
+            for suffix in suffixes:
+                candidate = Path(os.path.expanduser(directory.strip('"'))) / (
+                    name + suffix
+                )
+                if candidate.is_file():
+                    return str(candidate)
+        return None
+    search_path = os.pathsep.join(
+        os.path.expanduser(directory)
+        for directory in path_value.split(os.pathsep)
+        if directory
+    )
+    return shutil.which(name, path=search_path)
+
+
+def codex_launch_command(
+    candidate: str, args: list[str], environment: Mapping[str, str]
+) -> list[str]:
+    """Use identical script launch semantics for probing and SDK startup."""
+    target = launch_target("codex", candidate)
+    command = target.command(args)
+    if target.launcher != "direct":
+        command[0] = (
+            find_executable_on_path("powershell.exe", environment.get("PATH"))
+            or find_executable_on_path("pwsh.exe", environment.get("PATH"))
+            or command[0]
+        )
+        command.insert(2, "-NonInteractive")
+        if target.launcher == "cmd":
+            command[-1] += "; exit $LASTEXITCODE"
+    return command
+
+
+def runtime_binary_metadata(
+    selection: CodexRuntimeBinarySelection,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "mode": selection.mode,
+        "source": selection.source,
+        "codexBin": selection.codex_bin,
+        "loginShell": selection.login_shell,
+        "loginShellPath": selection.login_shell_path,
+    }
+    if selection.reason is not None:
+        metadata["reason"] = selection.reason
+    return metadata
